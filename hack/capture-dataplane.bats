@@ -11,6 +11,7 @@
 #   - lb_announcer_node       -- the speaker node of the most recent announce;
 #   - lb_capture_decision     -- capture only when every probe failed.
 #   - pod_filter_affected     -- retain scheduled NotReady pods even without IPs.
+#   - pod_first_ready         -- pick the in-run healthy-pod reference for a node.
 #
 # The kubectl exec / tcpdump capture itself is not unit-testable (it needs a
 # live cluster); these tests pin the derivations that decide WHICH node to
@@ -61,6 +62,55 @@ E2E_CAPTURE_DATAPLANE_LIB=1
     'tenant|failed|192.0.2.83|node-b|False|Failed')"
 
   [ -z "$(printf '%s\n' "$rows" | pod_filter_affected)" ]
+}
+
+@test "pod_first_ready picks the first Ready, Running pod and skips the rest" {
+  rows="$(printf '%s\n' \
+    'tenant|not-ready|192.0.2.90|False|Running' \
+    'tenant|pending|192.0.2.91|True|Pending' \
+    'tenant|healthy-1|192.0.2.92|True|Running' \
+    'tenant|healthy-2|192.0.2.93|True|Running')"
+
+  out="$(printf '%s\n' "$rows" | pod_first_ready)"
+
+  [ "$out" = "tenant|healthy-1|192.0.2.92" ]
+}
+
+@test "pod_first_ready emits nothing when no pod on the node is Ready and Running" {
+  rows="$(printf '%s\n' \
+    'tenant|not-ready|192.0.2.94|False|Running' \
+    'tenant|pending|192.0.2.95|True|Pending')"
+
+  [ -z "$(printf '%s\n' "$rows" | pod_first_ready)" ]
+}
+
+@test "pod_first_ready emits nothing on empty input" {
+  [ -z "$(printf '' | pod_first_ready)" ]
+}
+
+@test "pod_first_ready skips a hostNetwork pod even when it is Ready, Running, and first" {
+  # cilium-agent / kube-ovn-cni / ovs-ovn run hostNetwork on every node, and a
+  # hostNetwork pod's podIP IS the node's own address -- picking one as the
+  # healthy-pod reference would show the same local-route fingerprint as the
+  # bug #3615 exists to characterise, for an unrelated reason, defeating the
+  # whole point of the control.
+  rows="$(printf '%s\n' \
+    'cozy-cilium|cilium-agent-abcde|192.0.2.10|True|Running|true' \
+    'tenant|workload|192.0.2.96|True|Running|')"
+
+  out="$(printf '%s\n' "$rows" | pod_first_ready)"
+
+  [ "$out" = "tenant|workload|192.0.2.96" ]
+}
+
+@test "pod_first_ready treats a blank hostNetwork column as NOT hostNetwork" {
+  # The API omits spec.hostNetwork (omitempty) when it is false/unset, so
+  # kubectl's jsonpath emits an empty string, not the literal "false".
+  rows="$(printf '%s\n' 'tenant|workload|192.0.2.97|True|Running|')"
+
+  out="$(printf '%s\n' "$rows" | pod_first_ready)"
+
+  [ "$out" = "tenant|workload|192.0.2.97" ]
 }
 
 @test "runtime checks LoadBalancers when there are no affected pods" {

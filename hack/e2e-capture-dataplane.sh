@@ -35,6 +35,16 @@
 #     kernel-path misforward / missing route / wrong rule / unresolved neighbor
 #     -- the actual mechanism behind host->local-pod "connection refused" on the
 #     legacy-routing path (the crux of the transient).
+#   - Address attribution for a podIP that turns out to be a LOCAL address of
+#     the host netns instead of reachable via ovn0 (a route to nowhere-in-
+#     particular is not enough to name the owner): the same host netns above
+#     also gets `ip -o addr show` (every interface) and `ip route show table
+#     local`, and one Ready, non-hostNetwork pod on the same node gets the
+#     identical per-pod capture below as an in-run healthy-pod control, since
+#     this collector otherwise inspects NotReady pods only and had no
+#     same-window baseline. hostNetwork is excluded because its podIP IS the
+#     node's own address, so it would show the same local-route fingerprint
+#     as the bug for an unrelated reason.
 #   - OVS/OVN on the node: `ovs-ofctl dump-flows br-int`, and the OVN
 #     Port_Binding / Logical_Switch_Port for the pod (LSP name = <pod>.<ns> in
 #     kube-ovn) plus a bounded `ovn-sbctl lflow-list`.
@@ -211,6 +221,24 @@ pod_filter_affected() {
   awk -F'|' '$4 != "" && $5 != "True" && $6 != "Succeeded" && $6 != "Failed"'
 }
 
+# pod_first_ready: stdin = `namespace|name|podIP|ready|phase|hostNetwork` rows,
+# already scoped to one node by the caller's kubectl field-selector and with
+# the affected pod itself excluded. Emits `namespace|name|podIP` for the first
+# pod that is Ready=True, Running, and NOT hostNetwork -- the in-run
+# healthy-pod control for that node (see the address-attribution addition in
+# the header block) -- then stops. hostNetwork pods are excluded because their
+# podIP IS the node's own address: cilium-agent / kube-ovn-cni / ovs-ovn run
+# hostNetwork on every node, so without this exclusion the "healthy" reference
+# could legitimately resolve `ip route get <ip>` to `local <ip> dev lo table
+# local` -- the exact fingerprint #3615 is trying to distinguish from the
+# actual bug -- and silently defeat the whole point of the control. A blank
+# hostNetwork column counts as NOT hostNetwork (the API omits the field when
+# false); only the literal string "true" excludes. Empty output means no
+# eligible Ready pod exists on the node.
+pod_first_ready() {
+  awk -F'|' '$4 == "True" && $5 == "Running" && $6 != "true" { print $1 "|" $2 "|" $3; exit }'
+}
+
 # Sourcing guard: hack/capture-dataplane.bats sets E2E_CAPTURE_DATAPLANE_LIB and
 # sources this file purely to reach the helpers above; return before touching $1
 # or running any capture so the unit test never needs a cluster. The script's
@@ -367,11 +395,155 @@ capture_node() {
       echo "=== host netns: ip addr show ovn0 ==="
       timeout 15 kubectl exec -n "$KUBEOVN_NS" "$cni" -c cni-server -- \
         ip addr show ovn0 2>&1 || true
+
+      echo
+      echo "=== host netns: ip -o addr show, all interfaces (address attribution) ==="
+      # ovn0 alone cannot name the owner when a podIP turns out to be a LOCAL
+      # address instead: the interface actually holding it might be anything on
+      # the host (see the header block). This is the same info scoped to every
+      # interface, not just ovn0.
+      timeout 15 kubectl exec -n "$KUBEOVN_NS" "$cni" -c cni-server -- \
+        ip -o addr show 2>&1 || true
+
+      echo
+      echo "=== host netns: ip route show table local (address attribution) ==="
+      # A podIP resolving to `local <ip> dev lo table local` here is the
+      # fingerprint from the header block: it wins over the ovn0 route in
+      # `main` because table local is consulted first (see `ip rule` above).
+      timeout 15 kubectl exec -n "$KUBEOVN_NS" "$cni" -c cni-server -- \
+        ip route show table local 2>&1 || true
     else
       echo
       echo "(no kube-ovn-cni pod found on node $node -- host netns capture skipped)"
     fi
   } >> "$nf" 2>&1 || true
+}
+
+# capture_pod_dataplane <ns> <pod> <podip> <node> <label> -- the pod-specific
+# captures (Ready conditions/events, cilium CT, host route, kernel conntrack,
+# OVN port binding, OVS ovn-installed) for ONE pod on <node>. <label> is
+# stamped in the section header: "NotReady" for an affected pod, "REFERENCE
+# (Ready)" for the in-run healthy-pod control added for the address-
+# attribution gap in the header block. Writes to stdout; the caller redirects
+# into the pod's output file. $central (the ovn-central pod, or empty) is read
+# from the caller's scope rather than threaded as a parameter, matching how
+# the rest of this script shares node-global lookups.
+capture_pod_dataplane() {
+  _cpd_ns=$1; _cpd_pod=$2; _cpd_ip=$3; _cpd_node=$4; _cpd_label=$5
+
+  _cpd_agent=$(pod_on_node "$CILIUM_NS" k8s-app=cilium "$_cpd_node")
+  _cpd_ovs=$(pod_on_node "$KUBEOVN_NS" app=ovs "$_cpd_node")
+  _cpd_cni=$(pod_on_node "$KUBEOVN_NS" app=kube-ovn-cni "$_cpd_node")
+
+  echo "################################################################"
+  echo "# POD $_cpd_ns/$_cpd_pod  podIP=${_cpd_ip:-<none>}  node=$_cpd_node  ($_cpd_label)"
+  echo "# node-global captures are in node-$_cpd_node.txt"
+  echo "################################################################"
+
+  echo
+  echo "=== pod Ready conditions + recent probe events ==="
+  kubectl get pod -n "$_cpd_ns" "$_cpd_pod" \
+    -o jsonpath='{range .status.conditions[*]}{.type}={.status} reason={.reason}: {.message}{"\n"}{end}' 2>&1 || true
+  kubectl get events -n "$_cpd_ns" --field-selector "involvedObject.name=$_cpd_pod" \
+    -o jsonpath='{range .items[*]}{.lastTimestamp}{" "}{.reason}{": "}{.message}{"\n"}{end}' 2>&1 || true
+
+  if [ -z "$_cpd_ip" ]; then
+    echo
+    echo "=== pod has no podIP; IP-specific route/conntrack capture skipped ==="
+    echo "Node-global Cilium/OVN state and pod allocation events remain captured."
+  fi
+
+  if [ -n "$_cpd_ip" ] && [ -n "$_cpd_agent" ]; then
+    echo
+    echo "=== cilium-dbg bpf ct list global | grep $_cpd_ip (node=$_cpd_node agent=$_cpd_agent) ==="
+    timeout 25 kubectl exec -n "$CILIUM_NS" "$_cpd_agent" -c cilium-agent -- \
+      sh -c "cilium-dbg bpf ct list global 2>/dev/null | grep -F '$_cpd_ip' || echo 'no CT entries for $_cpd_ip'" 2>&1 || true
+  fi
+
+  if [ -n "$_cpd_ip" ] && [ -n "$_cpd_cni" ]; then
+    echo
+    echo "=== host netns: ip route get $_cpd_ip (via kube-ovn cni-server) ==="
+    timeout 15 kubectl exec -n "$KUBEOVN_NS" "$_cpd_cni" -c cni-server -- \
+      ip route get "$_cpd_ip" 2>&1 || true
+
+    echo
+    echo "=== host netns: kernel conntrack for $_cpd_ip ==="
+    # Under enable-host-legacy-routing the host->local-pod path is in the
+    # kernel netfilter conntrack table, NOT cilium BPF -- this is the
+    # authoritative table for the transient. Prefer the conntrack CLI; fall
+    # back to /proc/net/nf_conntrack when it is absent from the image.
+    timeout 15 kubectl exec -n "$KUBEOVN_NS" "$_cpd_cni" -c cni-server -- \
+      sh -c "if command -v conntrack >/dev/null 2>&1; then conntrack -L 2>/dev/null | grep -F '$_cpd_ip' || echo 'no conntrack entries for $_cpd_ip'; else grep -F '$_cpd_ip' /proc/net/nf_conntrack 2>/dev/null || echo 'no conntrack CLI; no /proc/net/nf_conntrack match for $_cpd_ip'; fi" 2>&1 || true
+  fi
+
+  if [ -n "$central" ]; then
+    echo
+    echo "=== OVN Port_Binding / Logical_Switch_Port for $_cpd_pod.$_cpd_ns ==="
+    # kube-ovn names the OVN logical port <pod>.<namespace>.
+    timeout 20 kubectl exec -n "$KUBEOVN_NS" "$central" -c ovn-central -- \
+      ovn-sbctl --no-leader-only find port_binding "logical_port=$_cpd_pod.$_cpd_ns" 2>&1 || true
+    timeout 20 kubectl exec -n "$KUBEOVN_NS" "$central" -c ovn-central -- \
+      ovn-nbctl --no-leader-only find logical_switch_port "name=$_cpd_pod.$_cpd_ns" 2>&1 || true
+  fi
+
+  if [ -n "$_cpd_ovs" ]; then
+    echo
+    echo "=== OVS interface ovn-installed flag + ts for iface-id=$_cpd_pod.$_cpd_ns (ovs pod $_cpd_ovs) ==="
+    # kube-ovn stamps external_ids:ovn-installed (+ -ts) on the pod's OVS
+    # interface once ovn-controller reports the port programmed -- this is
+    # the barrier the CNI waits on. The OVS interface name is opaque, so
+    # look it up by iface-id (<pod>.<ns>), then read the flag + timestamp.
+    # An ovn-installed-ts set early (before physical_flow_output installed
+    # the local-delivery flow, see node-$node.txt) is the I-P-lag signature.
+    _cpd_ovsif=$(timeout 20 kubectl exec -n "$KUBEOVN_NS" "$_cpd_ovs" -c openvswitch -- \
+      ovs-vsctl --no-heading --columns=name find interface "external_ids:iface-id=$_cpd_pod.$_cpd_ns" 2>/dev/null \
+      | head -n 1 | tr -d '" ')
+    if [ -n "$_cpd_ovsif" ]; then
+      echo "ovs interface = $_cpd_ovsif"
+      timeout 20 kubectl exec -n "$KUBEOVN_NS" "$_cpd_ovs" -c openvswitch -- \
+        ovs-vsctl get interface "$_cpd_ovsif" external_ids:ovn-installed external_ids:ovn-installed-ts 2>&1 || true
+    else
+      echo "no OVS interface with external_ids:iface-id=$_cpd_pod.$_cpd_ns"
+    fi
+  fi
+}
+
+# capture_pod_reference <ns> <pod> <node> <outfile> -- the in-run healthy-pod
+# control for #3615's address-attribution gap: this collector otherwise
+# inspects NotReady pods only, so there is no same-window baseline for what a
+# normal route/conntrack looks like on the SAME node. Picks one Ready, Running,
+# non-hostNetwork pod on <node> other than <ns>/<pod> and runs the identical
+# per-pod capture against it, appended to <outfile>. hostNetwork is excluded
+# by pod_first_ready (see its doc comment): a hostNetwork pod's podIP is the
+# node's own address, so it would "legitimately" show the same local-route
+# fingerprint as the bug this control exists to rule out. Honest about the
+# negative: when no eligible Ready pod exists on the node, that absence is
+# recorded too, not left silent.
+capture_pod_reference() {
+  _cpr_ns=$1; _cpr_pod=$2; _cpr_node=$3; _cpr_of=$4
+
+  _cpr_ref=$(kubectl get pods -A --field-selector "spec.nodeName=$_cpr_node" \
+    -o jsonpath='{range .items[*]}{.metadata.namespace}{"|"}{.metadata.name}{"|"}{.status.podIP}{"|"}{.status.conditions[?(@.type=="Ready")].status}{"|"}{.status.phase}{"|"}{.spec.hostNetwork}{"\n"}{end}' \
+    2>/dev/null | awk -F'|' -v sns="$_cpr_ns" -v spod="$_cpr_pod" '$1 == sns && $2 == spod { next } { print }' \
+    | pod_first_ready)
+
+  if [ -z "$_cpr_ref" ]; then
+    {
+      echo
+      echo "################################################################"
+      echo "# REFERENCE (Ready) pod on node=$_cpr_node: none found -- no in-run baseline available"
+      echo "################################################################"
+    } >> "$_cpr_of" 2>&1 || true
+    return 0
+  fi
+
+  _cpr_refns=$(printf '%s' "$_cpr_ref" | cut -d'|' -f1)
+  _cpr_refpod=$(printf '%s' "$_cpr_ref" | cut -d'|' -f2)
+  _cpr_refip=$(printf '%s' "$_cpr_ref" | cut -d'|' -f3)
+  {
+    echo
+    capture_pod_dataplane "$_cpr_refns" "$_cpr_refpod" "$_cpr_refip" "$_cpr_node" "REFERENCE (Ready), for comparison with $_cpr_ns/$_cpr_pod"
+  } >> "$_cpr_of" 2>&1 || true
 }
 
 if [ -z "$affected" ]; then
@@ -410,84 +582,10 @@ else
     # ip rule, ovn0 addr) -- captured once per node.
     capture_node "$node"
 
-    # Pod-specific state.
+    # Pod-specific state, plus the in-run healthy-pod reference for #3615.
     pf="$OUT/pod-$ns-$pod.txt"
-    agent=$(pod_on_node "$CILIUM_NS" k8s-app=cilium "$node")
-    ovs=$(pod_on_node "$KUBEOVN_NS" app=ovs "$node")
-    {
-      echo "################################################################"
-      echo "# POD $ns/$pod  podIP=${podip:-<none>}  node=$node  (Ready=$_ready)"
-      echo "# node-global captures are in node-$node.txt"
-      echo "################################################################"
-
-      echo
-      echo "=== pod Ready conditions + recent probe events ==="
-      kubectl get pod -n "$ns" "$pod" \
-        -o jsonpath='{range .status.conditions[*]}{.type}={.status} reason={.reason}: {.message}{"\n"}{end}' 2>&1 || true
-      kubectl get events -n "$ns" --field-selector "involvedObject.name=$pod" \
-        -o jsonpath='{range .items[*]}{.lastTimestamp}{" "}{.reason}{": "}{.message}{"\n"}{end}' 2>&1 || true
-
-      if [ -z "$podip" ]; then
-        echo
-        echo "=== pod has no podIP; IP-specific route/conntrack capture skipped ==="
-        echo "Node-global Cilium/OVN state and pod allocation events remain captured."
-      fi
-
-      if [ -n "$podip" ] && [ -n "$agent" ]; then
-        echo
-        echo "=== cilium-dbg bpf ct list global | grep $podip (node=$node agent=$agent) ==="
-        timeout 25 kubectl exec -n "$CILIUM_NS" "$agent" -c cilium-agent -- \
-          sh -c "cilium-dbg bpf ct list global 2>/dev/null | grep -F '$podip' || echo 'no CT entries for $podip'" 2>&1 || true
-      fi
-
-      cni=$(pod_on_node "$KUBEOVN_NS" app=kube-ovn-cni "$node")
-      if [ -n "$podip" ] && [ -n "$cni" ]; then
-        echo
-        echo "=== host netns: ip route get $podip (via kube-ovn cni-server) ==="
-        timeout 15 kubectl exec -n "$KUBEOVN_NS" "$cni" -c cni-server -- \
-          ip route get "$podip" 2>&1 || true
-
-        echo
-        echo "=== host netns: kernel conntrack for $podip ==="
-        # Under enable-host-legacy-routing the host->local-pod path is in the
-        # kernel netfilter conntrack table, NOT cilium BPF -- this is the
-        # authoritative table for the transient. Prefer the conntrack CLI; fall
-        # back to /proc/net/nf_conntrack when it is absent from the image.
-        timeout 15 kubectl exec -n "$KUBEOVN_NS" "$cni" -c cni-server -- \
-          sh -c "if command -v conntrack >/dev/null 2>&1; then conntrack -L 2>/dev/null | grep -F '$podip' || echo 'no conntrack entries for $podip'; else grep -F '$podip' /proc/net/nf_conntrack 2>/dev/null || echo 'no conntrack CLI; no /proc/net/nf_conntrack match for $podip'; fi" 2>&1 || true
-      fi
-
-      if [ -n "$central" ]; then
-        echo
-        echo "=== OVN Port_Binding / Logical_Switch_Port for $pod.$ns ==="
-        # kube-ovn names the OVN logical port <pod>.<namespace>.
-        timeout 20 kubectl exec -n "$KUBEOVN_NS" "$central" -c ovn-central -- \
-          ovn-sbctl --no-leader-only find port_binding "logical_port=$pod.$ns" 2>&1 || true
-        timeout 20 kubectl exec -n "$KUBEOVN_NS" "$central" -c ovn-central -- \
-          ovn-nbctl --no-leader-only find logical_switch_port "name=$pod.$ns" 2>&1 || true
-      fi
-
-      if [ -n "$ovs" ]; then
-        echo
-        echo "=== OVS interface ovn-installed flag + ts for iface-id=$pod.$ns (ovs pod $ovs) ==="
-        # kube-ovn stamps external_ids:ovn-installed (+ -ts) on the pod's OVS
-        # interface once ovn-controller reports the port programmed -- this is
-        # the barrier the CNI waits on. The OVS interface name is opaque, so
-        # look it up by iface-id (<pod>.<ns>), then read the flag + timestamp.
-        # An ovn-installed-ts set early (before physical_flow_output installed
-        # the local-delivery flow, see node-$node.txt) is the I-P-lag signature.
-        ovsif=$(timeout 20 kubectl exec -n "$KUBEOVN_NS" "$ovs" -c openvswitch -- \
-          ovs-vsctl --no-heading --columns=name find interface "external_ids:iface-id=$pod.$ns" 2>/dev/null \
-          | head -n 1 | tr -d '" ')
-        if [ -n "$ovsif" ]; then
-          echo "ovs interface = $ovsif"
-          timeout 20 kubectl exec -n "$KUBEOVN_NS" "$ovs" -c openvswitch -- \
-            ovs-vsctl get interface "$ovsif" external_ids:ovn-installed external_ids:ovn-installed-ts 2>&1 || true
-        else
-          echo "no OVS interface with external_ids:iface-id=$pod.$ns"
-        fi
-      fi
-    } > "$pf" 2>&1 || true
+    capture_pod_dataplane "$ns" "$pod" "$podip" "$node" "NotReady, Ready=$_ready" > "$pf" 2>&1 || true
+    capture_pod_reference "$ns" "$pod" "$node" "$pf"
   done
   log "host->pod data-plane capture complete"
   }
