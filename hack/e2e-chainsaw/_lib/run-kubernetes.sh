@@ -777,7 +777,17 @@ ${ouroboros_addon}
       instanceType: u1.medium
       maxReplicas: 10
       minReplicas: 2
-      resources: {}
+      # TEMP experiment (Refs #3513): the worker VM rendered as 1 vCPU under
+      # u1.medium (compute limit cpu:"1"), and on the contended 8-core CI sandbox
+      # node that single, CFS-throttled core stretches the Talos boot past the
+      # node-Ready budget. Explicit resources override the instancetype and give
+      # the guest 4 vCPU (KubeVirt keeps the container request low via the cluster
+      # cpuAllocationRatio, so scheduling headroom is unaffected) to test whether
+      # relieving the CPU cap fixes node-join. On an uncontended cluster (dev3)
+      # the same worker boots apid in ~14s, so this targets the CI environment.
+      resources:
+        cpu: "4"
+        memory: 4Gi
       roles:
       - ingress-nginx
   storageClass: replicated
