@@ -20,8 +20,16 @@ CUT="$REPO_ROOT/.github/workflows/cut-prerelease.yaml"
 BACKPORT="$REPO_ROOT/.github/workflows/backport.yaml"
 
 # Strip YAML comments. POSIX `grep` only: the unit-test runner has no ripgrep.
-# grep exits 1 when nothing is selected (legitimate for an all-comment block) and
-# 2 on a real error, so only the latter propagates.
+# grep exits 1 when nothing is selected (legitimate for an all-comment block)
+# and 2 on a real error. Do not read the `rc` check below as what catches
+# that: code_lines is never the last stage of a pipeline in this file, so
+# ordinary (non-pipefail) pipe semantics discard whatever it itself returns,
+# and `hack/cozytest.sh`'s translator appends `return 0` before every
+# function's closing brace -- code_lines' included -- making its own exit
+# status even less trustworthy as a signal. What actually catches a real grep
+# error is unconditional: every pin below asserts a non-empty block or an
+# exact match count against code_lines' OUTPUT, so a swallowed error surfaces
+# as an empty extraction or "0 matches" instead of a silent pass.
 code_lines() {
   local rc=0
   grep -v '^[[:space:]]*#' || rc=$?

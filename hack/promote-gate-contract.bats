@@ -34,7 +34,16 @@ input_block() {
 # runner has no ripgrep, and a missing filter used to be swallowed by `|| true`,
 # silently reducing every pin to "0 matches" instead of failing on the real
 # cause. grep exits 1 when nothing is selected (legitimate for an empty block)
-# and 2 on an actual error, so only the latter propagates.
+# and 2 on an actual error. Do not read the `rc` check below as what catches
+# that: code_lines is never the last stage of a pipeline in this file, so
+# ordinary (non-pipefail) pipe semantics discard whatever it itself returns,
+# and `hack/cozytest.sh`'s translator appends `return 0` before every
+# function's closing brace -- code_lines' included -- making its own exit
+# status even less trustworthy as a signal. What actually catches a real grep
+# error is unconditional: every pin below asserts an exact match count or a
+# non-empty block against code_lines' OUTPUT, so a swallowed error surfaces
+# as "0 matches" or an empty extraction, the same failure shape the original
+# `|| true` bug produced, instead of a silent pass.
 code_lines() {
   local rc=0
   grep -v '^[[:space:]]*#' || rc=$?
