@@ -41,6 +41,17 @@ kubectl() {
     return 0
   fi
 
+  if [ "${1:-}" = -n ] && [ "${2:-}" = tenant-test ] \
+    && [ "${3:-}" = get ] && [ "${4:-}" = pods ]; then
+    printf '%s\n' 'virt-launcher-mock'
+    return 0
+  fi
+
+  if [ "${1:-}" = -n ] && [ "${2:-}" = tenant-test ] && [ "${3:-}" = logs ]; then
+    printf 'mock serial console for %s\n' "$*"
+    return 0
+  fi
+
   if [ "${3:-}" = exec ] && [ "${4:-}" = deploy/linstor-controller ]; then
     printf '%s\n' '104857600:satellite-a'
     return 0
@@ -256,6 +267,28 @@ assert_file_lacks_pattern() {
   assert_file_contains '[capture exit code: 124]' "$COZY_REPORT_DIR/snapshots/$COZY_SNAPSHOT_NAME/tenant-talos/worker-a/kubelet.log"
   assert_file_contains '[capture exit code: 0]' "$COZY_REPORT_DIR/snapshots/$COZY_SNAPSHOT_NAME/tenant-talos/worker-b/dmesg.log"
   assert_file_contains '[capture exit code: 0]' "$COZY_REPORT_DIR/snapshots/$COZY_SNAPSHOT_NAME/tenant-talos/worker-b/kubelet.log"
+}
+
+@test "serial console is captured per worker VM even when apid is unreachable" {
+  # TEMPORARY diagnostic coverage (Refs #3513): a worker whose default interface
+  # reports no IP has an unreachable apid, yet its guest serial console must still
+  # be captured. No EXIT trap here on purpose: the frozen bats guard pins this
+  # file's trap count, and a failure should leave the workdir for inspection.
+  . hack/e2e-chainsaw/_lib/run-kubernetes.sh
+  tmp=$(mktemp -d)
+  kubectl_calls="$tmp/kubectl.calls"
+  kubectl_vmi_json="$tmp/vmis.json"
+  COZY_REPORT_DIR="$tmp/report"
+  COZY_SNAPSHOT_NAME=console-smoke
+  printf '%s\n' '{"items":[{"metadata":{"name":"worker-a"},"status":{"interfaces":[{"name":"default"}]}}]}' >"$kubectl_vmi_json"
+
+  cozy_capture_tenant_talos test-latest-version || true
+
+  base="$COZY_REPORT_DIR/snapshots/$COZY_SNAPSHOT_NAME/tenant-talos/worker-a"
+  assert_file_contains '-c guest-console-log' "$kubectl_calls"
+  [ -s "$base/console.log" ]
+  assert_file_contains 'mock serial console' "$base/console.log"
+  rm -rf "$tmp"
 }
 
 @test "cleanup deletes diagnostic Certificate before its Pod and Secret" {
