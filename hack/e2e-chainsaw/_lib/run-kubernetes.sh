@@ -581,7 +581,7 @@ cozy_capture_tenant_talos() (
   local report_dir="${COZY_REPORT_DIR:-/workspace/_out/cozyreport}/snapshots/${COZY_SNAPSHOT_NAME:-kubernetes}/tenant-talos"
   local selector="cluster.x-k8s.io/cluster-name=kubernetes-${test_name},cluster.x-k8s.io/role=worker"
   local pod_name="kubernetes-${test_name}-talos-diagnostics"
-  local workdir vmi_name node_ip launcher
+  local workdir vmi_name node_ip
   local has_node_ip=false
 
   umask 077
@@ -603,33 +603,6 @@ cozy_capture_tenant_talos() (
       >"${report_dir}/setup-error.log"
     return 1
   fi
-
-  # TEMPORARY diagnostic (Refs #3513): capture the KubeVirt guest serial console
-  # for every worker VM up front, before the talosctl path below. talosctl needs
-  # a reachable apid (:50000); when a worker stalls in early Talos boot before
-  # apid answers, those captures come back empty and the guest is invisible. The
-  # serial console (enabled by the chart's logSerialConsole) records the boot
-  # regardless of apid, so grab it independent of node IP. Best-effort: a missing
-  # virt-launcher Pod or guest-console-log container is recorded, never fatal.
-  # Runs against the management cluster where the virt-launcher Pods live. Revert
-  # together with the chart logSerialConsole change.
-  while IFS='|' read -r vmi_name node_ip; do
-    [ -n "${vmi_name}" ] || continue
-    mkdir -p "${report_dir}/${vmi_name}"
-    if launcher=$(kubectl -n tenant-test get pods \
-      -l "kubevirt.io=virt-launcher,vm.kubevirt.io/name=${vmi_name}" \
-      -o jsonpath='{.items[0].metadata.name}' --request-timeout=30s 2>/dev/null) \
-      && [ -n "${launcher}" ]; then
-      echo "--- capturing tenant worker serial console: ${vmi_name} (${launcher}) ---"
-      kubectl -n tenant-test logs "${launcher}" -c guest-console-log \
-        --tail=5000 --request-timeout=60s \
-        >"${report_dir}/${vmi_name}/console.log" \
-        2>"${report_dir}/${vmi_name}/console-error.log" || true
-    else
-      printf '%s\n' "no virt-launcher Pod found for VMI ${vmi_name}" \
-        >"${report_dir}/${vmi_name}/console-error.log"
-    fi
-  done <"${workdir}/vmis.rows"
 
   # Record missing addresses before spending time on Certificate issuance or a
   # helper Pod. If no worker booted far enough for KubeVirt to report an IP,
